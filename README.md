@@ -40,6 +40,29 @@ Then, you can simply use the address and port as the baseURL as you require (htt
 
 **Reminder:** When setting a baseURL, make you sure you include /v1/ at the end of the URL if you're using this as a OpenAI compatible endpoint (e.g http://127.0.0.1:8000/v1)
 
+## Production Server
+
+For production deployments, it is recommended to use Gunicorn instead of Flask's built-in development server.
+
+1. Activate your virtual environment:
+   ```bash
+   source .venv/bin/activate
+   ```
+
+2. Install Gunicorn (if not already installed):
+   ```bash
+   pip install gunicorn
+   ```
+
+3. Start the server with Gunicorn:
+   ```bash
+   gunicorn -w 4 -b 0.0.0.0:8000 'chatmock.app:create_app()'
+   ```
+   - `-w 4`: Number of worker processes (adjust as needed)
+   - `-b 0.0.0.0:8000`: Bind to all interfaces on port 8000
+   - `'chatmock.app:create_app()'`: Entry point for the Flask app factory
+
+Gunicorn is a production-grade WSGI server and is recommended for running Flask applications in production environments.
 # Examples
 
 ### Python 
