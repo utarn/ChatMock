@@ -8,7 +8,7 @@ from flask import Blueprint, Response, current_app, jsonify, make_response, requ
 
 from .config import BASE_INSTRUCTIONS
 from .http import build_cors_headers
-from .reasoning import apply_reasoning_to_message, build_reasoning_param
+from .reasoning import apply_reasoning_to_message, build_reasoning_param, extract_reasoning_from_model_name
 from .upstream import normalize_model_name, start_upstream_request
 from .utils import (
     convert_chat_messages_to_responses_input,
@@ -45,7 +45,8 @@ def chat_completions() -> Response:
         except Exception:
             return jsonify({"error": {"message": "Invalid JSON body"}}), 400
 
-    model = normalize_model_name(payload.get("model"), debug_model)
+    requested_model = payload.get("model")
+    model = normalize_model_name(requested_model, debug_model)
     messages = payload.get("messages")
     if messages is None and isinstance(payload.get("prompt"), str):
         messages = [{"role": "user", "content": payload.get("prompt") or ""}]
@@ -63,6 +64,8 @@ def chat_completions() -> Response:
             content = sys_msg.get("content") if isinstance(sys_msg, dict) else ""
             messages.insert(0, {"role": "user", "content": content})
     is_stream = bool(payload.get("stream"))
+    stream_options = payload.get("stream_options") if isinstance(payload.get("stream_options"), dict) else {}
+    include_usage = bool(stream_options.get("include_usage", False))
 
     tools_responses = convert_tools_chat_to_responses(payload.get("tools"))
     tool_choice = payload.get("tool_choice", "auto")
@@ -74,7 +77,8 @@ def chat_completions() -> Response:
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": payload.get("prompt")}]}
         ]
 
-    reasoning_overrides = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else None
+    model_reasoning = extract_reasoning_from_model_name(requested_model)
+    reasoning_overrides = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else model_reasoning
     reasoning_param = build_reasoning_param(reasoning_effort, reasoning_summary, reasoning_overrides)
 
     upstream, error_resp = start_upstream_request(
@@ -107,11 +111,12 @@ def chat_completions() -> Response:
         resp = Response(
             sse_translate_chat(
                 upstream,
-                model,
+                requested_model or model,
                 created,
                 verbose=verbose,
                 vlog=print if verbose else None,
                 reasoning_compat=reasoning_compat,
+                include_usage=include_usage,
             ),
             status=upstream.status_code,
             mimetype="text/event-stream",
@@ -127,6 +132,19 @@ def chat_completions() -> Response:
     response_id = "chatcmpl"
     tool_calls: List[Dict[str, Any]] = []
     error_message: str | None = None
+    usage_obj: Dict[str, int] | None = None
+
+    def _extract_usage(evt: Dict[str, Any]) -> Dict[str, int] | None:
+        try:
+            usage = (evt.get("response") or {}).get("usage")
+            if not isinstance(usage, dict):
+                return None
+            pt = int(usage.get("input_tokens") or 0)
+            ct = int(usage.get("output_tokens") or 0)
+            tt = int(usage.get("total_tokens") or (pt + ct))
+            return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt}
+        except Exception:
+            return None
     try:
         for raw in upstream.iter_lines(decode_unicode=False):
             if not raw:
@@ -144,6 +162,9 @@ def chat_completions() -> Response:
             except Exception:
                 continue
             kind = evt.get("type")
+            mu = _extract_usage(evt)
+            if mu:
+                usage_obj = mu
             if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("id"), str):
                 response_id = evt["response"].get("id") or response_id
             if kind == "response.output_text.delta":
@@ -183,12 +204,11 @@ def chat_completions() -> Response:
     if tool_calls:
         message["tool_calls"] = tool_calls
     message = apply_reasoning_to_message(message, reasoning_summary_text, reasoning_full_text, reasoning_compat)
-
     completion = {
         "id": response_id or "chatcmpl",
         "object": "chat.completion",
         "created": created,
-        "model": model,
+        "model": requested_model or model,
         "choices": [
             {
                 "index": 0,
@@ -196,6 +216,7 @@ def chat_completions() -> Response:
                 "finish_reason": "stop",
             }
         ],
+        **({"usage": usage_obj} if usage_obj else {}),
     }
     resp = make_response(jsonify(completion), upstream.status_code)
     for k, v in build_cors_headers().items():
@@ -216,18 +237,22 @@ def completions() -> Response:
     except Exception:
         return jsonify({"error": {"message": "Invalid JSON body"}}), 400
 
-    model = normalize_model_name(payload.get("model"), debug_model)
+    requested_model = payload.get("model")
+    model = normalize_model_name(requested_model, debug_model)
     prompt = payload.get("prompt")
     if isinstance(prompt, list):
         prompt = "".join([p if isinstance(p, str) else "" for p in prompt])
     if not isinstance(prompt, str):
         prompt = payload.get("suffix") or ""
     stream_req = bool(payload.get("stream", False))
+    stream_options = payload.get("stream_options") if isinstance(payload.get("stream_options"), dict) else {}
+    include_usage = bool(stream_options.get("include_usage", False))
 
     messages = [{"role": "user", "content": prompt or ""}]
     input_items = convert_chat_messages_to_responses_input(messages)
 
-    reasoning_overrides = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else None
+    model_reasoning = extract_reasoning_from_model_name(requested_model)
+    reasoning_overrides = payload.get("reasoning") if isinstance(payload.get("reasoning"), dict) else model_reasoning
     reasoning_param = build_reasoning_param(reasoning_effort, reasoning_summary, reasoning_overrides)
     upstream, error_resp = start_upstream_request(
         model,
@@ -251,7 +276,14 @@ def completions() -> Response:
 
     if stream_req:
         resp = Response(
-            sse_translate_text(upstream, model, created, verbose=verbose, vlog=(print if verbose else None)),
+            sse_translate_text(
+                upstream,
+                requested_model or model,
+                created,
+                verbose=verbose,
+                vlog=(print if verbose else None),
+                include_usage=include_usage,
+            ),
             status=upstream.status_code,
             mimetype="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -262,6 +294,18 @@ def completions() -> Response:
 
     full_text = ""
     response_id = "cmpl"
+    usage_obj: Dict[str, int] | None = None
+    def _extract_usage(evt: Dict[str, Any]) -> Dict[str, int] | None:
+        try:
+            usage = (evt.get("response") or {}).get("usage")
+            if not isinstance(usage, dict):
+                return None
+            pt = int(usage.get("input_tokens") or 0)
+            ct = int(usage.get("output_tokens") or 0)
+            tt = int(usage.get("total_tokens") or (pt + ct))
+            return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt}
+        except Exception:
+            return None
     try:
         for raw_line in upstream.iter_lines(decode_unicode=False):
             if not raw_line:
@@ -280,6 +324,9 @@ def completions() -> Response:
                 continue
             if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("id"), str):
                 response_id = evt["response"].get("id") or response_id
+            mu = _extract_usage(evt)
+            if mu:
+                usage_obj = mu
             kind = evt.get("type")
             if kind == "response.output_text.delta":
                 full_text += evt.get("delta") or ""
@@ -292,10 +339,11 @@ def completions() -> Response:
         "id": response_id or "cmpl",
         "object": "text_completion",
         "created": created,
-        "model": model,
+        "model": requested_model or model,
         "choices": [
             {"index": 0, "text": full_text, "finish_reason": "stop", "logprobs": None}
         ],
+        **({"usage": usage_obj} if usage_obj else {}),
     }
     resp = make_response(jsonify(completion), upstream.status_code)
     for k, v in build_cors_headers().items():
@@ -305,9 +353,21 @@ def completions() -> Response:
 
 @openai_bp.route("/v1/models", methods=["GET"])
 def list_models() -> Response:
-    models = {"object": "list", "data": [{"id": "gpt-5", "object": "model", "owned_by": "owner"}]}
+    expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
+    data = []
+    if expose_variants:
+        variant_ids = [
+            "gpt-5",
+            "gpt-5-high",
+            "gpt-5-medium",
+            "gpt-5-low",
+            "gpt-5-minimal",
+        ]
+        data = [{"id": mid, "object": "model", "owned_by": "owner"} for mid in variant_ids]
+    else:
+        data = [{"id": "gpt-5", "object": "model", "owned_by": "owner"}]
+    models = {"object": "list", "data": data}
     resp = make_response(jsonify(models), 200)
     for k, v in build_cors_headers().items():
         resp.headers.setdefault(k, v)
     return resp
-
